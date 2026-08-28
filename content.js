@@ -6,12 +6,15 @@
  * THIS SCRIPT RUNS IN THE **ISOLATED** WORLD.
  *
  * Responsibilities:
- *   1. Inject `inject.js` into the MAIN world so it can hook native APIs.
- *   2. Render a floating speed-control overlay (always-on-top).
- *   3. Bridge user interactions from the overlay to the MAIN world engine
- *      via `window.postMessage`.
- *   4. Forward the active speed to the background service worker so it can
- *      update the extension badge.
+ *   1. Render a floating speed-control overlay (top frame only).
+ *   2. Bridge speed changes to the MAIN world engine via `window.postMessage`.
+ *   3. Relay user-initiated changes through the service worker so that
+ *      *every* frame in the tab — the courseware is usually in an iframe —
+ *      applies the same multiplier.
+ *
+ * `inject.js` is no longer injected from here: it is declared in the manifest
+ * as a `"world": "MAIN"` content script, which runs it before any page script
+ * and sidesteps page CSP entirely.
  *
  * ============================================================================
  */
@@ -26,43 +29,62 @@
   if (window.__VIOS_CONTENT_LOADED__) return;
   window.__VIOS_CONTENT_LOADED__ = true;
 
-  // =========================================================================
-  // 1.  Inject `inject.js` into the MAIN World
-  // =========================================================================
-
   /**
-   * Manifest V3 allows `world: "MAIN"` in `content_scripts`, but that
-   * requires the script to be declared statically.  For maximum flexibility
-   * (and because some browsers / versions lag behind), we inject manually
-   * via a <script> tag whose `src` points to a web_accessible_resource.
-   *
-   * This guarantees inject.js executes in the PAGE's JS context and can
-   * override `window.setTimeout`, etc.
+   * The engine runs in every frame, but the overlay must not: courseware
+   * pages routinely nest several same-origin iframes, and one panel per frame
+   * meant a stack of overlays piled in the corner.
    */
-
-  function injectMainWorldScript() {
-    const script = document.createElement('script');
-    script.src = chrome.runtime.getURL('inject.js');
-    script.dataset.vios = 'injected'; // marker for debugging
-    (document.head || document.documentElement).appendChild(script);
-
-    // Clean up the <script> tag once loaded (optional, keeps DOM tidy).
-    script.addEventListener('load', () => script.remove());
-    script.addEventListener('error', (err) => {
-      console.error('[VIOS content] Failed to inject time-warp script:', err);
-    });
-  }
-
-  injectMainWorldScript();
+  let isTopFrame = true;
+  try { isTopFrame = window.top === window; } catch (_) { isTopFrame = false; }
 
   // =========================================================================
-  // 2.  State
+  // 1.  State
   // =========================================================================
 
   let currentSpeed = 1.0;
   const MIN_SPEED  = 0.25;
   const MAX_SPEED  = 4.0;
   const STEP       = 0.25;
+
+  let ui = null; // Populated once the DOM is ready (top frame only).
+
+  // =========================================================================
+  // 2.  Helpers
+  // =========================================================================
+
+  function roundTo(value, decimals) {
+    const factor = Math.pow(10, decimals);
+    return Math.round(value * factor) / factor;
+  }
+
+  function formatSpeed(speed) {
+    return speed.toFixed(2) + '×';
+  }
+
+  function clamp(value, min, max) {
+    return Math.min(max, Math.max(min, value));
+  }
+
+  /**
+   * `chrome.runtime.sendMessage` rejects asynchronously, so a bare try/catch
+   * never sees the failure — it surfaces as an unchecked `lastError` console
+   * error instead.  The callback swallows it.
+   */
+  function safeSendMessage(message, onReply) {
+    try {
+      chrome.runtime.sendMessage(message, (response) => {
+        if (chrome.runtime.lastError) {
+          // Extension reloaded, or the worker went away mid-flight.
+          if (onReply) onReply(null);
+          return;
+        }
+        if (onReply) onReply(response);
+      });
+    } catch (_) {
+      // Extension context invalidated (page outlived the extension).
+      if (onReply) onReply(null);
+    }
+  }
 
   // =========================================================================
   // 3.  Build the Floating UI Overlay
@@ -102,19 +124,28 @@
       boxShadow:      '0 8px 32px rgba(0,0,0,0.45), 0 0 0 1px rgba(108,92,231,0.3), inset 0 1px 0 rgba(255,255,255,0.06)',
       padding:        '6px 6px',
       userSelect:     'none',
+      touchAction:    'none',                // let us own pointer gestures
       cursor:         'default',
       transition:     'opacity 0.25s ease, transform 0.25s ease',
       opacity:        '0.92',
       transform:      'translateY(0)',
     });
 
-    // Hover effects.
+    // ----- Drag State (declared early: the hover handlers consult it) -----
+    let isDragging  = false;
+    let dragOffsetX = 0;
+    let dragOffsetY = 0;
+
+    // Hover effects.  Suppressed mid-drag — the 2 px lift would otherwise
+    // fight the pointer position and make the panel jitter under the cursor.
     container.addEventListener('mouseenter', () => {
+      if (isDragging) return;
       container.style.opacity   = '1';
       container.style.transform = 'translateY(-2px)';
       container.style.boxShadow = '0 12px 40px rgba(0,0,0,0.55), 0 0 0 1px rgba(108,92,231,0.5), inset 0 1px 0 rgba(255,255,255,0.1)';
     });
     container.addEventListener('mouseleave', () => {
+      if (isDragging) return;
       container.style.opacity   = '0.92';
       container.style.transform = 'translateY(0)';
       container.style.boxShadow = '0 8px 32px rgba(0,0,0,0.45), 0 0 0 1px rgba(108,92,231,0.3), inset 0 1px 0 rgba(255,255,255,0.06)';
@@ -130,6 +161,7 @@
       textTransform:  'uppercase',
       color:          'rgba(108, 92, 231, 0.9)',
       whiteSpace:     'nowrap',
+      cursor:         'grab',
     });
     badge.textContent = 'VIOS';
 
@@ -147,7 +179,7 @@
 
     // ----- Decrease Button -----
     const btnMinus = makeButton('−', () => {
-      setSpeed(Math.max(MIN_SPEED, roundTo(currentSpeed - STEP, 2)));
+      requestSpeed(Math.max(MIN_SPEED, roundTo(currentSpeed - STEP, 2)));
     });
 
     // ----- Speed Label -----
@@ -166,12 +198,12 @@
 
     // ----- Increase Button -----
     const btnPlus = makeButton('+', () => {
-      setSpeed(Math.min(MAX_SPEED, roundTo(currentSpeed + STEP, 2)));
+      requestSpeed(Math.min(MAX_SPEED, roundTo(currentSpeed + STEP, 2)));
     });
 
     // ----- Reset Button -----
     const btnReset = makeButton('↺', () => {
-      setSpeed(1.0);
+      requestSpeed(1.0);
     }, true /* isReset */);
 
     // ----- Assemble -----
@@ -184,35 +216,66 @@
     container.appendChild(btnReset);
 
     // ----- Drag Support -----
-    let isDragging  = false;
-    let dragOffsetX = 0;
-    let dragOffsetY = 0;
+    //
+    // Pointer events with pointer capture, rather than mousemove/mouseup on
+    // `document`: a mouseup released outside the viewport (or over an iframe,
+    // which is the normal case on courseware) never reached the old document
+    // listener, leaving the panel welded to the cursor.
 
-    container.addEventListener('mousedown', (e) => {
+    function clampIntoView() {
+      if (container.style.left === '' && container.style.top === '') return;
+      const maxX = Math.max(0, window.innerWidth  - container.offsetWidth);
+      const maxY = Math.max(0, window.innerHeight - container.offsetHeight);
+      container.style.left = `${clamp(parseFloat(container.style.left) || 0, 0, maxX)}px`;
+      container.style.top  = `${clamp(parseFloat(container.style.top)  || 0, 0, maxY)}px`;
+    }
+
+    container.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
       // Only drag from non-button areas.
-      if (e.target.tagName === 'BUTTON' || e.target.closest('button')) return;
-      isDragging = true;
+      if (e.target.closest && e.target.closest('button')) return;
+
       const rect = container.getBoundingClientRect();
+      isDragging  = true;
       dragOffsetX = e.clientX - rect.left;
       dragOffsetY = e.clientY - rect.top;
+
+      // Freeze the current on-screen box as explicit left/top and drop the
+      // hover transform, so the pointer maths starts from what's visible.
       container.style.transition = 'none';
+      container.style.transform  = 'translateY(0)';
+      container.style.left       = `${rect.left}px`;
+      container.style.top        = `${rect.top}px`;
+      container.style.right      = 'auto';
+      container.style.bottom     = 'auto';
+      badge.style.cursor         = 'grabbing';
+
+      try { container.setPointerCapture(e.pointerId); } catch (_) { /* ignore */ }
       e.preventDefault();
     });
 
-    document.addEventListener('mousemove', (e) => {
+    container.addEventListener('pointermove', (e) => {
       if (!isDragging) return;
-      container.style.left   = `${e.clientX - dragOffsetX}px`;
-      container.style.top    = `${e.clientY - dragOffsetY}px`;
-      container.style.right  = 'auto';
-      container.style.bottom = 'auto';
+      // Clamped so the panel can never be dragged off-screen and stranded.
+      const maxX = Math.max(0, window.innerWidth  - container.offsetWidth);
+      const maxY = Math.max(0, window.innerHeight - container.offsetHeight);
+      container.style.left = `${clamp(e.clientX - dragOffsetX, 0, maxX)}px`;
+      container.style.top  = `${clamp(e.clientY - dragOffsetY, 0, maxY)}px`;
     });
 
-    document.addEventListener('mouseup', () => {
-      if (isDragging) {
-        isDragging = false;
-        container.style.transition = 'opacity 0.25s ease, transform 0.25s ease';
-      }
-    });
+    function endDrag(e) {
+      if (!isDragging) return;
+      isDragging = false;
+      container.style.transition = 'opacity 0.25s ease, transform 0.25s ease';
+      badge.style.cursor = 'grab';
+      try { container.releasePointerCapture(e.pointerId); } catch (_) { /* ignore */ }
+    }
+
+    container.addEventListener('pointerup', endDrag);
+    container.addEventListener('pointercancel', endDrag);
+
+    // A window resize can leave a dragged panel outside the viewport.
+    window.addEventListener('resize', clampIntoView);
 
     // ----- Append to Page -----
     if (document.body) {
@@ -237,6 +300,7 @@
    */
   function makeButton(label, onClick, isReset = false) {
     const btn = document.createElement('button');
+    btn.type = 'button';
     btn.textContent = label;
     Object.assign(btn.style, {
       all:            'unset',
@@ -277,33 +341,27 @@
   }
 
   // =========================================================================
-  // 4.  Helpers
+  // 4.  Speed Management
   // =========================================================================
-
-  function roundTo(value, decimals) {
-    const factor = Math.pow(10, decimals);
-    return Math.round(value * factor) / factor;
-  }
-
-  function formatSpeed(speed) {
-    return speed.toFixed(2) + '×';
-  }
-
-  // =========================================================================
-  // 5.  Speed Management
-  // =========================================================================
-
-  let ui = null; // Populated once the DOM is ready.
 
   /**
-   * Sets the speed:
-   *   1. Updates local state.
-   *   2. Updates the UI label.
-   *   3. Posts a message to the MAIN world (inject.js).
-   *   4. Notifies the background service worker to update the badge.
+   * A user-initiated change.  Applied locally at once for responsiveness, then
+   * relayed via the service worker to every frame in the tab — the courseware
+   * (and therefore its timers and its <audio>) almost always lives in an
+   * iframe, so a change confined to this frame would do nothing visible.
    */
-  function setSpeed(newSpeed) {
-    currentSpeed = newSpeed;
+  function requestSpeed(newSpeed) {
+    newSpeed = clamp(newSpeed, MIN_SPEED, MAX_SPEED);
+    applySpeed(newSpeed);
+    safeSendMessage({ type: 'VIOS_SET_SPEED', speed: newSpeed });
+  }
+
+  /**
+   * Applies a speed to *this* frame only: updates state, the label (if this
+   * frame owns the overlay) and the MAIN-world engine.
+   */
+  function applySpeed(newSpeed) {
+    currentSpeed = clamp(newSpeed, MIN_SPEED, MAX_SPEED);
 
     // Update label.
     if (ui?.speedLabel) {
@@ -321,28 +379,36 @@
       }
     }
 
-    // Broadcast to MAIN world.
+    // Hand it to the MAIN world engine in this frame.
     window.postMessage({ type: 'VIOS_SET_SPEED', speed: currentSpeed }, '*');
-
-    // Update badge.
-    try {
-      chrome.runtime.sendMessage({ type: 'VIOS_SET_BADGE', speed: currentSpeed });
-    } catch (_) {
-      // Extension context may have been invalidated (page outlived extension).
-    }
-
-    console.log(`[VIOS content] Speed → ${currentSpeed}×`);
   }
 
   // =========================================================================
-  // 6.  Listen for Acknowledgements from the MAIN World
+  // 5.  Messages From the MAIN World
   // =========================================================================
 
   window.addEventListener('message', (event) => {
     if (event.source !== window) return;
+    const data = event.data;
+    if (!data) return;
 
-    if (event.data?.type === 'VIOS_SPEED_ACK') {
-      console.log(`[VIOS content] Engine confirmed speed: ${event.data.speed}×`);
+    if (data.type === 'VIOS_ENGINE_READY') {
+      // The engine just came up.  Re-send the current speed: without this
+      // handshake, a speed set before the engine finished initialising was
+      // silently dropped.
+      applySpeed(currentSpeed);
+    } else if (data.type === 'VIOS_SPEED_ACK') {
+      console.log(`[VIOS content] Engine confirmed speed: ${data.speed}×`);
+    }
+  });
+
+  // =========================================================================
+  // 6.  Messages From the Service Worker (tab-wide broadcast)
+  // =========================================================================
+
+  chrome.runtime.onMessage.addListener((message) => {
+    if (message?.type === 'VIOS_APPLY_SPEED' && typeof message.speed === 'number') {
+      applySpeed(message.speed);
     }
   });
 
@@ -355,38 +421,58 @@
    * Alt + [   →  Decrease speed
    * Alt + \   →  Reset to 1×
    *
-   * These shortcuts are deliberately obscure to avoid conflicts with
-   * courseware hotkeys.
+   * Matched on `e.code`, not `e.key`: with Alt held, `e.key` is the *composed*
+   * character, which on macOS and on non-US layouts is not "]" / "[" / "\" at
+   * all — the shortcuts simply never fired there.  `e.code` is physical-key
+   * based and layout independent.
+   *
+   * Registered in the capture phase so courseware that swallows keydown on
+   * `document` can't eat them first.
    */
 
   document.addEventListener('keydown', (e) => {
-    // Ignore if the user is typing in an input.
-    const tag = (e.target.tagName || '').toLowerCase();
-    if (tag === 'input' || tag === 'textarea' || e.target.isContentEditable) return;
+    // Alt alone — Ctrl/Meta combinations belong to the page or the browser.
+    if (!e.altKey || e.ctrlKey || e.metaKey) return;
 
-    if (!e.altKey) return;
+    // Ignore if the user is typing.
+    const target = e.target;
+    const tag = (target?.tagName || '').toLowerCase();
+    if (tag === 'input' || tag === 'textarea' || tag === 'select' || target?.isContentEditable) return;
 
-    if (e.key === ']') {
-      e.preventDefault();
-      setSpeed(Math.min(MAX_SPEED, roundTo(currentSpeed + STEP, 2)));
-    } else if (e.key === '[') {
-      e.preventDefault();
-      setSpeed(Math.max(MIN_SPEED, roundTo(currentSpeed - STEP, 2)));
-    } else if (e.key === '\\') {
-      e.preventDefault();
-      setSpeed(1.0);
+    let next;
+    switch (e.code) {
+      case 'BracketRight': next = Math.min(MAX_SPEED, roundTo(currentSpeed + STEP, 2)); break;
+      case 'BracketLeft':  next = Math.max(MIN_SPEED, roundTo(currentSpeed - STEP, 2)); break;
+      case 'Backslash':    next = 1.0; break;
+      default: return;
     }
-  });
+
+    e.preventDefault();
+    e.stopPropagation();
+    requestSpeed(next);
+  }, true);
 
   // =========================================================================
-  // 8.  Initialise UI When DOM Is Ready
+  // 8.  Initialise
   // =========================================================================
 
   function init() {
-    ui = buildOverlay();
-    // Broadcast the initial speed so inject.js is aware (in case it loaded
-    // before the content script, which shouldn't happen but is good practice).
-    setSpeed(currentSpeed);
+    if (isTopFrame) ui = buildOverlay();
+
+    /**
+     * Announce this frame and adopt the tab's speed.
+     *
+     * The top frame loading means a fresh page, so the worker resets the tab
+     * to 1×.  A subframe instead *joins* at whatever the tab is already set
+     * to — otherwise an iframe that loads a few slides in would silently drag
+     * the whole tab back to real time.
+     */
+    safeSendMessage(
+      { type: isTopFrame ? 'VIOS_TOP_FRAME_READY' : 'VIOS_FRAME_READY' },
+      (response) => {
+        applySpeed(typeof response?.speed === 'number' ? response.speed : 1.0);
+      },
+    );
   }
 
   if (document.readyState === 'loading') {
