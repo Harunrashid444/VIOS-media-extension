@@ -1,0 +1,76 @@
+# ──────────────────────────────────────────────
+# VIOS – Video & Timeline Accelerator
+# .gitignore
+# ──────────────────────────────────────────────
+
+
+# ── Personal Notes ────────────────────────────
+# Private scratch notes; never commit these.
+NOTES.md
+notes.md
+*.notes.md
+
+
+# ── OS-generated files ─────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V8
+.Trashes
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
+
+# ── Editor & IDE directories ──────────────────
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.suo
+*.user
+*.userprefs
+.vs/
+
+
+# ── Node / npm (if tooling is added later) ────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+yarn.lock
+.pnp
+.pnp.js
+
+
+# ── Build / dist artefacts ────────────────────
+dist/
+build/
+out/
+*.crx
+*.pem
+*.zip
+
+
+# ── Environment & secrets ─────────────────────
+.env
+.env.local
+.env.*.local
+
+
+# ── Logs ──────────────────────────────────────
+logs/
+*.log
+
+
+# ── Test coverage ─────────────────────────────
+coverage/
+.nyc_output/
+
+
+# ── Temporary files ───────────────────────────
+*.tmp
+*.temp
+*.swp
+*~
