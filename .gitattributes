@@ -1,0 +1,8 @@
+# Normalize line endings: store LF in the repo, check out LF everywhere.
+# Keeps diffs clean when the extension is edited across OSes.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
